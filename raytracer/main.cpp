@@ -260,15 +260,14 @@ inline Vec3 perturb_normal(const Vec3 &n, double sigma) {
   double theta = 2.0 * M_PI * u2;
   double x = r * std::cos(theta);
   double y = r * std::sin(theta);
-  double z = r * std::cos(theta + M_PI / 2.0);
   double u3 = randf();
   double u4 = randf();
   if (u3 < 1e-9)
     u3 = 1e-9;
   double r2 = std::sqrt(-2.0 * std::log(u3));
-  double z_val = r2 * std::cos(2.0 * M_PI * u4);
+  double z = r2 * std::cos(2.0 * M_PI * u4);
 
-  return normalize(n + Vec3{x, y, z_val} * sigma);
+  return normalize(n + Vec3{x, y, z} * sigma);
 }
 
 struct AABB {
