@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <meta charset="utf-8">
+  <link rel="icon" href="data:,">
+  <title>CPU Jitter</title>
+  <script src="wrapWebGL2.js"></script>
+  <script>
+
+/**
+ * Fetches, reads, and compiles GLSL; sets two global variables; and begins
+ * the animation
+ */
+async function setup() {
+  window.gl = document.querySelector('canvas').getContext('webgl2') 
+  gl.enable(gl.BLEND)
+  const vs = await fetch('vs.glsl').then(res => res.text())
+  const fs = await fetch('fs.glsl').then(res => res.text())
+  window.program = compile(vs,fs)
+
+  window.iPoints = [
+    [-0.4,  0.8], [ 0.4,  0.8], [ 0.4,  0.4], [-0.4,  0.4],
+    [-0.2,  0.4], [ 0.2,  0.4], [ 0.2, -0.4], [-0.2, -0.4],
+    [-0.4, -0.4], [ 0.4, -0.4], [ 0.4, -0.8], [-0.4, -0.8],
+  ];
+
+  window.oPoints = [
+    [-0.45,  0.85], [ 0.45,  0.85],
+    [-0.40,  0.80], [ 0.40,  0.80],
+    [-0.40,  0.40], [-0.20,  0.40], [ 0.20,  0.40], [ 0.40,  0.40],
+    [-0.45,  0.35], [-0.25,  0.35], [ 0.25,  0.35], [ 0.45,  0.35],
+    [-0.45, -0.35], [-0.25, -0.35], [ 0.25, -0.35], [ 0.45, -0.35],
+    [-0.40, -0.40], [-0.20, -0.40], [ 0.20, -0.40], [ 0.40, -0.40],
+    [-0.40, -0.80], [ 0.40, -0.80],
+    [-0.45, -0.85], [ 0.45, -0.85],
+  ];
+
+  const inside = [
+    // top bar 
+    0,4,3, 0,1,4, 4,1,5, 5,1,2,
+    // stem
+    4,5,7, 7,5,6,
+    // bottom bar
+    8,7,11, 7,6,11, 10,11,6, 6,9,10
+  ].map(i => iPoints[i]).flat()
+
+  const outline = [
+    0,1,2,
+    2,1,3,
+    1,11,3,
+    3,11,7,
+    11,10,7,
+    7,10,6,
+    10,14,6,
+    6,14,18,
+    14,15,18,
+    18,15,19,
+    15,23,19,
+    19,23,21,
+    23,22,21,
+    21,22,20,
+    22,12,20,
+    20,12,16,
+    12,13,16,
+    16,13,17,
+    13,9,17,
+    17,9,5,
+    9,8,5,
+    5,8,4,
+    8,0,4,
+    4,0,2
+  ].map(i => oPoints[i]).flat()
+
+  window.baseInside = new Float32Array(inside)
+  window.baseOutline = new Float32Array(outline);
+
+  window.insideVerts = new Float32Array(baseInside);
+  window.outlineVerts = new Float32Array(baseOutline);
+
+  window.insideVAO = gl.createVertexArray()
+  gl.bindVertexArray(insideVAO)
+  window.insideBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, insideBuffer)
+  gl.bufferData(gl.ARRAY_BUFFER, insideVerts, gl.DYNAMIC_DRAW)
+  gl.enableVertexAttribArray(0)
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+
+  window.outlineVAO = gl.createVertexArray()
+  gl.bindVertexArray(outlineVAO)
+  window.outlineBuffer = gl.createBuffer()
+  gl.bindBuffer(gl.ARRAY_BUFFER, outlineBuffer)
+  gl.bufferData(gl.ARRAY_BUFFER, outlineVerts, gl.DYNAMIC_DRAW)
+  gl.enableVertexAttribArray(0)
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+
+  program.uniforms = {
+    transform: gl.getUniformLocation(program, "transform"),
+    uColor: gl.getUniformLocation(program, "uColor"),
+  }
+
+  fillScreen()
+  window.addEventListener('resize', fillScreen)
+
+  tick(0)
+}
+
+/**
+ * Compiles two shaders, links them together, looks up their uniform locations,
+ * and returns the result. Reports any shader errors to the console.
+ *
+ * @param {string} vs_source - the source code of the vertex shader
+ * @param {string} fs_source - the source code of the fragment shader 
+ * @return{WebGLProgram} the compiled and linked program 
+ */
+function compile(vs_source, fs_source) {
+  const vs = gl.createShader(gl.VERTEX_SHADER)
+  gl.shaderSource(vs, vs_source)
+  gl.compileShader(vs)
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(vs))
+    throw Error("Vertex shader compilation failed")
+  }
+
+  const fs = gl.createShader(gl.FRAGMENT_SHADER)
+  gl.shaderSource(fs, fs_source)
+  gl.compileShader(fs)
+  if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(fs))
+    throw Error("Fragment shader compilation failed")
+  }
+
+  const program = gl.createProgram()
+  gl.attachShader(program, vs)
+  gl.attachShader(program, fs)
+  gl.linkProgram(program)
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(program))
+    throw Error("Linking failed")
+  }
+
+  const uniforms = {}
+  for(let i=0; i<gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS); i+=1) {
+      let info = gl.getActiveUniform(program, i)
+      uniforms[info.name] = gl.getUniformLocation(program, info.name)
+  }
+  program.uniforms = uniforms
+
+  return program 
+}
+
+/**
+ * Runs the animation using requestAnimationFrame. This is like a loop that
+ * runs once per screen refresh, but a loop won't work because we need to let 
+ * the browser do other things between ticks. Instead, we have a function that 
+ * requests itself be queued to be run again as its last step.
+ *
+ * @param {Number} milliseconds - milliseconds since web page loaded;
+ *        automatically provided by the browser when invoked with 
+ *        requestAnimationFrame 
+ */
+function tick(milliseconds) {
+  const seconds = milliseconds / 1000
+  draw(seconds)
+  requestAnimationFrame(tick) // <- only call this here, nowhere else
+}
+
+/**
+ * Clears the screen, sends two uniforms to the GPU, and asks the GPU to draw 
+ * several points. Note that no geometry is provided; the point locations are 
+ * computed based on the uniforms in the vertex shader.
+ *
+ * @param {Number} seconds - the number of seconds since the animation began
+ */
+function draw(seconds) {
+  gl.clear(gl.COLOR_BUFFER_BIT)
+  gl.useProgram(program)
+
+  const jitter = (points) => {
+    for (let i = 0; i < points.length; i++) {
+      points[i][0] += (Math.random() - 0.5) * 0.005
+      points[i][1] += (Math.random() - 0.5) * 0.005
+    }
+  }
+
+  jitter(iPoints)
+  jitter(oPoints)
+
+  const inside = [
+    // top bar 
+    0,4,3, 0,1,4, 4,1,5, 5,1,2,
+    // stem
+    4,5,7, 7,5,6,
+    // bottom bar
+    8,7,11, 7,6,11, 10,11,6, 6,9,10
+  ].map(i => iPoints[i]).flat()
+  insideVerts.set(inside)
+
+  const outline = [
+    0,1,2,
+    2,1,3,
+    1,11,3,
+    3,11,7,
+    11,10,7,
+    7,10,6,
+    10,14,6,
+    6,14,18,
+    14,15,18,
+    18,15,19,
+    15,23,19,
+    19,23,21,
+    23,22,21,
+    21,22,20,
+    22,12,20,
+    20,12,16,
+    12,13,16,
+    16,13,17,
+    13,9,17,
+    17,9,5,
+    9,8,5,
+    5,8,4,
+    8,0,4,
+    4,0,2
+  ].map(i => oPoints[i]).flat()
+  outlineVerts.set(outline)
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, insideBuffer)
+  gl.bufferData(gl.ARRAY_BUFFER, insideVerts, gl.DYNAMIC_DRAW)
+  gl.bindBuffer(gl.ARRAY_BUFFER, outlineBuffer)
+  gl.bufferData(gl.ARRAY_BUFFER, outlineVerts, gl.DYNAMIC_DRAW)
+
+  const I = new Float32Array([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    0, 0, 0, 1
+  ])
+  gl.uniformMatrix4fv(program.uniforms.transform, false, I)
+
+  const connection = gl.TRIANGLES
+
+  gl.bindVertexArray(insideVAO)
+  gl.uniform3f(program.uniforms.uColor, 1.0, 0.373, 0.02)
+  gl.drawArrays(connection, 0, insideVerts.length / 2)
+
+  gl.bindVertexArray(outlineVAO)
+  gl.uniform3f(program.uniforms.uColor, 0.075, 0.16, 0.292)
+  gl.drawArrays(connection, 0, outlineVerts.length / 2)
+}
+
+/**
+ * Resizes the canvas to the largest square the screen can hold
+ */
+function fillScreen() {
+  let canvas = document.querySelector('canvas')
+  document.body.style.margin = '0'
+  canvas.style.width = '100vw'
+  canvas.style.height = '100vh'
+  let size = Math.min(canvas.clientWidth, canvas.clientHeight)
+  canvas.width = size 
+  canvas.height = size 
+  canvas.style.width = ''
+  canvas.style.height = ''
+  if (window.gl) {
+    gl.viewport(0,0, canvas.width, canvas.height)
+  }
+}
+
+window.addEventListener('load', setup)
+
+  </script>
+</head>
+<body>
+  <canvas width="300" height="300" style="background:white"></canvas>
+
+</body></html>

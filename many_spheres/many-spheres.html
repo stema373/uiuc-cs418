@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <meta charset="utf-8">
+  <link rel="icon" href="data:,">
+  <title>Many Spheres</title>
+  <script src="wrapWebGL2.js"></script>
+  <script src="math.js"></script>
+  <script>
+let gl, program;
+let posNormalBuffer = null;
+let indexBuffer = null;
+let indexCount = 0;
+
+let NUM_SPHERES = 0;
+const CUBE_WIDTH = 2.0;
+const HALF = CUBE_WIDTH / 2;
+const GRAVITY = [0, -3.0, 0];
+const ELASTICITY = 0.9;
+
+let spheres = []
+let lastTime = null;
+let resetTimer = 0;
+
+const rand = (a=0, b=1) => a + Math.random() * (b - a);
+const randVec = (mag=1) => {
+  let u = Math.random() * 2 - 1, v = Math.random() * 2 - 1, w = Math.random() * 2 - 1;
+  let m = Math.sqrt(u * u + v * v + w * w) || 1;
+  return [u / m * mag, v / m * mag, w / m * mag];
+}
+
+/**
+ * Create GL buffers for point sprites
+ */
+function createBuffers() {
+  centerBuffer = gl.createBuffer();
+  radiusBuffer = gl.createBuffer();
+  colorBuffer = gl.createBuffer();
+}
+
+/**
+ * Initialize spheres
+ */
+function resetSpheres(numSpheres = NUM_SPHERES) {
+  NUM_SPHERES = numSpheres;
+  spheres = [];
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    const radius = (Math.random() + 0.25) * (0.75 / Math.pow(NUM_SPHERES, 1/3));
+    const mass = radius * radius * radius;
+    const margin = radius;
+    const x = rand(-HALF + margin, HALF - margin);
+    const y = rand(-HALF + margin, HALF - margin);
+    const z = rand(-HALF + margin, HALF - margin);
+    const v = randVec(1.2);
+    const color = [Math.random() * 0.9 + 0.1, Math.random() * 0.9 + 0.1, Math.random() * 0.9 + 0.1];
+    spheres.push({pos: [x, y, z], vel: v, color, radius, mass});
+  }
+}
+
+/**
+ * Get grid cell index for a position 
+ */
+function getCellKey(pos, cellSize) {
+  const ix = Math.floor((pos[0] + HALF) / cellSize);
+  const iy = Math.floor((pos[1] + HALF) / cellSize);
+  const iz = Math.floor((pos[2] + HALF) / cellSize);
+  return `${ix},${iy},${iz}`;
+}
+
+/**
+ * Handle collision between two spheres 
+ */
+function handleSphereCollision(A, B) {
+  let delta = sub(B.pos, A.pos);
+  let dist = mag(delta);
+  const minDist = A.radius + B.radius;
+  if (dist === 0) {
+    delta = [rand(0.001, 0.01), rand(0.001, 0.01), rand(0.001, 0.01)];
+    dist = mag(delta);
+  }
+  if (dist < minDist) {
+    let n = div(delta, dist);
+    let penetration = minDist - dist;
+    let totalInvMass = 1 / A.mass + 1 / B.mass;
+    let correctionA = mul(n, penetration * (1 / A.mass) / totalInvMass);
+    let correctionB = mul(n, penetration * (1 / B.mass) / totalInvMass);
+    A.pos = sub(A.pos, correctionA);
+    B.pos = add(B.pos, correctionB);
+
+    let rv = sub(B.vel, A.vel);
+    let velAlong = dot(rv, n);
+    if (velAlong < 0) {
+      let jImp = -(1 + ELASTICITY) * velAlong / totalInvMass;
+      let impulse = mul(n, jImp);
+      A.vel = sub(A.vel, mul(impulse, 1 / A.mass));
+      B.vel = add(B.vel, mul(impulse, 1 / B.mass));
+    }
+  }
+}
+
+/**
+ * Euler method collision resolution with spatial hashing
+ */
+function physics(dt) {
+  if (dt <= 0) return;
+  const maxDt = 0.033;
+  if (dt > maxDt) dt = maxDt;
+
+  for (let s of spheres) {
+    s.vel = add(s.vel, mul(GRAVITY, dt));
+    s.pos = add(s.pos, mul(s.vel, dt));
+  }
+
+  // Wall collisions
+  for (let s of spheres) {
+    for (let a = 0; a < 3; a++) {
+      if (s.pos[a] < -HALF + s.radius) {
+        s.pos[a] = -HALF + s.radius;
+        if (s.vel[a] < 0) s.vel[a] = -s.vel[a] * ELASTICITY;
+      }
+      if (s.pos[a] > HALF - s.radius) {
+        s.pos[a] = HALF - s.radius;
+        if (s.vel[a] > 0) s.vel[a] = -s.vel[a] * ELASTICITY;
+      }
+    }
+  }
+
+  // Spatial hashing for sphere-sphere collisions
+  let maxRadius = 0;
+  for (let s of spheres) {
+    if (s.radius > maxRadius) maxRadius = s.radius;
+  }
+  const cellSize = maxRadius * 2;
+
+  const grid = new Map();
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    const s = spheres[i];
+    const key = getCellKey(s.pos, cellSize);
+    if (!grid.has(key)) grid.set(key, []);
+    grid.get(key).push(i);
+  }
+
+  // Check collisions using spatial hash 
+  const checkedPairs = new Set();
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    const A = spheres[i];
+    const [cx, cy, cz] = getCellKey(A.pos, cellSize).split(',').map(Number);
+
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          const neighborKey = `${cx + dx},${cy + dy},${cz + dz}`;
+          const cellSpheres = grid.get(neighborKey);
+          if (!cellSpheres) continue;
+
+          for (let j of cellSpheres) {
+            if (i >= j) continue;
+            const pairKey = i < j ? `${i},${j}` : `${j},${i}`;
+            if (checkedPairs.has(pairKey)) continue;
+            checkedPairs.add(pairKey);
+
+            const B = spheres[j];
+            handleSphereCollision(A, B);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Compiles two shaders, links them together, looks up their uniform locations,
+ * and returns the result. Reports any shader errors to the console.
+ *
+ * @param {string} vs_source - the source code of the vertex shader 
+ * @param {string} fs_source - the source code of the fragment shader 
+ * @return{WebGLProgram} the compiled and linked program
+*/
+function compile(vs_source, fs_source) {
+  const vs = gl.createShader(gl.VERTEX_SHADER)
+  gl.shaderSource(vs, vs_source)
+  gl.compileShader(vs)
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(vs))
+    throw Error("Vertex shader compilation failed")
+  }
+
+  const fs = gl.createShader(gl.FRAGMENT_SHADER)
+  gl.shaderSource(fs, fs_source)
+  gl.compileShader(fs)
+  if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(fs))
+    throw Error("Fragment shader compilation failed")
+  }
+
+  const program = gl.createProgram()
+  gl.attachShader(program, vs)
+  gl.attachShader(program, fs)
+  gl.linkProgram(program)
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(program))
+    throw Error("Linking failed")
+  }
+
+  const uniforms = {}
+  for (let i=0; i<gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS); i+=1) {
+    let info = gl.getActiveUniform(program, i)
+    uniforms[info.name] = gl.getUniformLocation(program, info.name)
+  }
+  program.uniforms = uniforms
+
+  return program
+}
+
+/**
+ * Setup WebGL
+ */
+async function setup() {
+  const canvas = document.querySelector('canvas')
+  gl = canvas.getContext('webgl2')
+  gl.enable(gl.DEPTH_TEST)
+
+  createBuffers()
+
+  const vs = await fetch('vs.glsl').then(res => res.text())
+  const fs = await fetch('fs.glsl').then(res => res.text())
+  program = compile(vs, fs)
+
+  fillScreen()
+  window.addEventListener('resize', fillScreen)
+
+  const input = document.querySelector('#spheres');
+  NUM_SPHERES = parseInt(input.value, 10);
+
+  resetSpheres(NUM_SPHERES);
+
+  document.querySelector('#submit').addEventListener('click', function() {
+    const numSpheres = parseInt(input.value, 10);
+    if (numSpheres > 0) {
+      resetSpheres(numSpheres);
+      resetTimer = 0;
+    }
+  });
+
+  tick(0)
+}
+
+/**
+ * Resize canvas to fill screen 
+ */
+function fillScreen() {
+  let canvas = document.querySelector('canvas')
+  document.body.style.margin = '0'
+  canvas.style.width = '100%'
+  canvas.style.height = '100%'
+  canvas.width = canvas.clientWidth
+  canvas.height = canvas.clientHeight
+  canvas.style.width = ''
+  canvas.style.height = ''
+  gl.viewport(0,0, canvas.width, canvas.height)
+}
+
+/**
+ * Runs the animation using requestAnimationFrame. This is like a loop that
+ * runs once per screen refresh, but a loop won't work because we need to let 
+ * the browser do other things between ticks. Instead, we have a function that 
+ * requests itself be queued to be run again as its last step.
+ *
+ * @param {Number} milliseconds - milliseconds since web page loaded;
+ *        automatically provided by the browser when invoked with 
+ *        requestAnimationFrame
+ */
+function tick(milliseconds) {
+  const seconds = milliseconds / 1000
+  draw(seconds)
+  requestAnimationFrame(tick) // <- only call this here, nowhere else
+}
+
+/**
+ * Draw frame 
+ */
+function draw(seconds) {
+  if (lastTime === null) lastTime = seconds;
+  const dt = seconds - lastTime;
+  lastTime = seconds;
+
+  if (dt > 0) {
+    const fps = 1 / dt;
+    document.querySelector('#fps').innerHTML = fps.toFixed(1);
+  }
+
+  resetTimer += dt
+  if (resetTimer >= 15) {
+    resetSpheres()
+    resetTimer = 0
+  }
+
+  physics(dt);
+
+  const canvas = document.querySelector('canvas');
+  const projMatrix = m4perspNegZ(0.1, 100, Math.PI / 3, canvas.width, canvas.height)
+
+  const eye = [0, 0.5, 4.0];
+  const center = [0, 0, 0]
+  const up = [0, 1, 0]
+
+  const viewMatrix = m4view(eye, center, up)
+
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+
+  gl.useProgram(program)
+
+  const lightDir = [1, -2, 1]
+  const lightDirNorm = normalize(lightDir)
+
+  const centers = new Float32Array(NUM_SPHERES * 3);
+  const radii = new Float32Array(NUM_SPHERES);
+  const colors = new Float32Array(NUM_SPHERES * 3);
+
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    centers[i * 3 + 0] = spheres[i].pos[0];
+    centers[i * 3 + 1] = spheres[i].pos[1];
+    centers[i * 3 + 2] = spheres[i].pos[2];
+    radii[i] = spheres[i].radius;
+    colors[i * 3 + 0] = spheres[i].color[0];
+    colors[i * 3 + 1] = spheres[i].color[1];
+    colors[i * 3 + 2] = spheres[i].color[2];
+  }
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, centerBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, centers, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, radiusBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, radii, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 0, 0);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, colors, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
+
+  gl.uniformMatrix4fv(gl.getUniformLocation(program, 'mv'), false, viewMatrix);
+  gl.uniformMatrix4fv(gl.getUniformLocation(program, 'p'), false, projMatrix);
+  gl.uniform3fv(gl.getUniformLocation(program, 'lightDirection'), lightDirNorm);
+  gl.uniform1f(gl.getUniformLocation(program, 'viewportSize'), canvas.height);
+
+  gl.drawArrays(gl.POINTS, 0, NUM_SPHERES);
+
+  gl.disableVertexAttribArray(0);
+  gl.disableVertexAttribArray(1);
+  gl.disableVertexAttribArray(2);
+}
+
+window.addEventListener('load', setup)
+
+  </script>
+    <style>
+    body {
+        margin: 0; border: none; padding: 0;
+        display: flex; flex-direction: column;
+        width: 100%; height: 100vh;
+    }
+    .controls {
+        flex: 0 0 auto;
+    }
+    .controls > * { margin: 1em; }
+    .display {
+        flex-grow: 1;
+        line-height: 0rem;
+    }
+    </style>
+</head>
+<body>
+<canvas></canvas>
+<div id="fps" style="position:fixed; bottom:1ex; right:1ex; display:table;"></div>
+<form class="controls" action="javascript:void(0);" style="position:fixed; top:1ex; left:1ex; display:table;">
+    <label>Spheres: <input id="spheres" type="number" value="50" style="width:5em;"/></label>
+    <input id="submit" type="submit" value="Restart simulation"/>
+</form>
+</body>
+</html>

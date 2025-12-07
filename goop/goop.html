@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <meta charset="utf-8">
+  <link rel="icon" href="data:,">
+  <title>Goop</title>
+  <script src="wrapWebGL2.js"></script>
+  <script>
+let gl, program;
+let centerBuffer = null;
+let radiusBuffer = null;
+let colorBuffer = null;
+
+let NUM_SPHERES = 200;
+const MIN = -1.0;
+const MAX = 1.0;
+const ELASTICITY = 1.0;
+
+let h = 0.5;
+let rho0 = 1 / 3;
+let k = 20;
+let mu = 1e-6;
+let particleRadius = 0.05;
+let mi = 0.01;
+let g = 1.0;
+
+let spheres = []
+let lastTime = null;
+
+let poly6Coeff, spikyGradCoeff, viscosityLapCoeff;
+
+function updateKernelCoefficients(h) {
+  const h2 = h * h;
+  const h5 = h2 * h2 * h;
+  const h8 = h5 * h2 * h;
+  poly6Coeff = 4 / (Math.PI * h8);
+  spikyGradCoeff = -10 / (Math.PI * h5);
+  viscosityLapCoeff = 40 / (Math.PI * h5);
+}
+
+function poly6(r, h) {
+  if (r > h || r < 0) return 0;
+  const x = (h * h - r * r);
+  return poly6Coeff * x * x * x;
+}
+
+function spikyGrad(r, h) {
+  if (r > h || r <= 0) return 0;
+  const x = (h - r);
+  return spikyGradCoeff * x * x;
+}
+
+function viscosityLaplacian(r, h) {
+  if (r > h || r < 0) return 0;
+  return viscosityLapCoeff * (h - r);
+}
+
+/**
+ * Create GL buffers for point sprites
+ */
+function createBuffers() {
+  centerBuffer = gl.createBuffer();
+  radiusBuffer = gl.createBuffer();
+  colorBuffer = gl.createBuffer();
+}
+
+/**
+ * Initialize spheres
+ */
+function resetSpheres(numSpheres = NUM_SPHERES) {
+  NUM_SPHERES = numSpheres;
+
+  h = 3 / (2 * Math.sqrt(Math.max(1, NUM_SPHERES)));
+  particleRadius = h / 3;
+  mi = (h * h) / 9;
+  rho0 = 1 / 3;
+  k = 20;
+  mu = 1e-6;
+  g = 1.0;
+
+  updateKernelCoefficients(h);
+
+  spheres = [];
+
+  const radius = particleRadius;
+  const mass = mi;
+
+  let pos = [radius - 1, radius - 1];
+  const gap = radius * 2;
+
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    spheres.push({
+      pos: [
+        pos[0] + Math.random() * gap / 10,
+        pos[1] + Math.random() * gap / 10
+      ],
+      vel: [0.0, 0.0],
+      radius,
+      mass,
+      color: [
+        Math.random() * 0.9 + 0.1,
+        Math.random() * 0.9 + 0.1,
+        Math.random() * 0.9 + 0.1
+      ]
+    });
+
+    pos[1] += gap;
+    if (pos[1] > 1 - radius) {
+      pos[1] = -1 + radius;
+      pos[0] += gap;
+    }
+  }
+}
+
+/**
+ * Get grid cell index for a position 
+ */
+function getCellKey(pos, cellSize) {
+  const ix = Math.floor((pos[0] - MIN) / cellSize);
+  const iy = Math.floor((pos[1] - MIN) / cellSize);
+  return `${ix},${iy}`;
+}
+
+/**
+ * Euler method collision resolution with spatial hashing
+ */
+function physics(dt) {
+  if (dt <= 0) return;
+  dt = h / 10;
+
+  const cellSize = 2 * h;
+  const grid = new Map();
+  const gravityForce = -g * mi;
+
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    const s = spheres[i];
+    const key = getCellKey(s.pos, cellSize);
+    if (!grid.has(key)) grid.set(key, []);
+    grid.get(key).push(i);
+    s.rho = 0;
+    s.pressure = 0;
+    s.force = [0, gravityForce];
+  }
+
+  function forNeighbors(i, fn) {
+    const A = spheres[i];
+    const [cx, cy] = getCellKey(A.pos, cellSize).split(',').map(Number);
+
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const arr = grid.get(`${cx + dx},${cy + dy}`);
+        if (!arr) continue;
+        for (let j of arr) {
+          fn(i, j);
+        }
+      }
+    }
+  }
+
+  // Compute densities
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    const A = spheres[i];
+    forNeighbors(i, (i, j) => {
+      const B = spheres[j];
+      const dx = A.pos[0] - B.pos[0];
+      const dy = A.pos[1] - B.pos[1];
+      const distSq = dx * dx + dy * dy;
+      const dist = Math.sqrt(distSq);
+      if (dist <= h) {
+        const w = poly6(dist, h);
+        A.rho += mi * w;
+      }
+    });
+  }
+
+  // Compute pressures
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    const s = spheres[i];
+    s.pressure = Math.max(k * (s.rho - rho0), 0);
+  }
+
+  // Compute pressure forces
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    const A = spheres[i];
+    const Arho2 = A.rho * A.rho;
+    const ApressureOverRho2 = A.pressure / Arho2;
+
+    forNeighbors(i, (i, j) => {
+      if (i === j) return;
+      const B = spheres[j];
+      const dx = A.pos[0] - B.pos[0];
+      const dy = A.pos[1] - B.pos[1];
+      const distSq = dx * dx + dy * dy;
+
+      if (distSq > 1e-24 && distSq <= h * h) {
+        const dist = Math.sqrt(distSq);
+        const invDist = 1 / dist;
+        const nx = dx * invDist;
+        const ny = dy * invDist;
+        const grad = spikyGrad(dist, h);
+
+        const coeff = mi * mi * (ApressureOverRho2 + B.pressure / (B.rho * B.rho)) * grad;
+        A.force[0] -= nx * coeff;
+        A.force[1] -= ny * coeff;
+      }
+    });
+  }
+
+  // Compute viscosity forces
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    const A = spheres[i];
+
+    forNeighbors(i, (i, j) => {
+      if (i === j) return;
+      const B = spheres[j];
+      const dx = A.pos[0] - B.pos[0];
+      const dy = A.pos[1] - B.pos[1];
+      const distSq = dx * dx + dy * dy;
+
+      if (distSq <= h * h) {
+        const dist = Math.sqrt(distSq);
+        const lap = viscosityLaplacian(dist, h);
+        const coeff = mu * mi * lap / (B.rho * B.rho);
+
+        A.force[0] += (B.vel[0] - A.vel[0]) * coeff;
+        A.force[1] += (B.vel[1] - A.vel[1]) * coeff;
+      }
+    });
+  }
+
+  // Integration and wall collisions
+  const invMass = 1 / mi;
+  const minBound = MIN + particleRadius;
+  const maxBound = MAX - particleRadius;
+
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    const s = spheres[i];
+
+    // Integrate velocity
+    s.vel[0] += s.force[0] * invMass * dt;
+    s.vel[1] += s.force[1] * invMass * dt;
+
+    // Integrate position
+    s.pos[0] += s.vel[0] * dt;
+    s.pos[1] += s.vel[1] * dt;
+
+    // Wall collisions
+    if (s.pos[0] < minBound) {
+      s.pos[0] = minBound;
+      if (s.vel[0] < 0) s.vel[0] = -s.vel[0] * ELASTICITY;
+    } else if (s.pos[0] > maxBound) {
+      s.pos[0] = maxBound;
+      if (s.vel[0] > 0) s.vel[0] = -s.vel[0] * ELASTICITY;
+    }
+
+    if (s.pos[1] < minBound) {
+      s.pos[1] = minBound;
+      if (s.vel[1] < 0) s.vel[1] = -s.vel[1] * ELASTICITY;
+    } else if (s.pos[1] > maxBound) {
+      s.pos[1] = maxBound;
+      if (s.vel[1] > 0) s.vel[1] = -s.vel[1] * ELASTICITY;
+    }
+  }
+}
+
+/**
+ * Compiles two shaders, links them together, looks up their uniform locations,
+ * and returns the result. Reports any shader errors to the console.
+ *
+ * @param {string} vs_source - the source code of the vertex shader 
+ * @param {string} fs_source - the source code of the fragment shader 
+ * @return{WebGLProgram} the compiled and linked program
+*/
+function compile(vs_source, fs_source) {
+  const vs = gl.createShader(gl.VERTEX_SHADER)
+  gl.shaderSource(vs, vs_source)
+  gl.compileShader(vs)
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(vs))
+    throw Error("Vertex shader compilation failed")
+  }
+
+  const fs = gl.createShader(gl.FRAGMENT_SHADER)
+  gl.shaderSource(fs, fs_source)
+  gl.compileShader(fs)
+  if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(fs))
+    throw Error("Fragment shader compilation failed")
+  }
+
+  const program = gl.createProgram()
+  gl.attachShader(program, vs)
+  gl.attachShader(program, fs)
+  gl.linkProgram(program)
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(program))
+    throw Error("Linking failed")
+  }
+
+  const uniforms = {}
+  for (let i=0; i<gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS); i+=1) {
+    let info = gl.getActiveUniform(program, i)
+    uniforms[info.name] = gl.getUniformLocation(program, info.name)
+  }
+  program.uniforms = uniforms
+
+  return program
+}
+
+/**
+ * Setup WebGL
+ */
+async function setup() {
+  const canvas = document.querySelector('canvas')
+  fpsDisplay = document.querySelector('#fps');
+  gl = canvas.getContext('webgl2')
+  gl.enable(gl.DEPTH_TEST)
+
+  createBuffers()
+
+  const vs = await fetch('vs.glsl').then(res => res.text())
+  const fs = await fetch('fs.glsl').then(res => res.text())
+  program = compile(vs, fs)
+
+  pUniformLoc = gl.getUniformLocation(program, 'p');
+  viewportSizeUniformLoc = gl.getUniformLocation(program, 'viewportSize');
+
+  fillScreen()
+  window.addEventListener('resize', fillScreen)
+
+  const input = document.querySelector('#spheres');
+  NUM_SPHERES = parseInt(input.value, 10) || NUM_SPHERES;
+
+  resetSpheres(NUM_SPHERES);
+
+  document.querySelector('#submit').addEventListener('click', function() {
+    const numSpheres = parseInt(input.value, 10);
+    if (numSpheres > 0) resetSpheres(numSpheres);
+  });
+
+  tick(0)
+}
+
+/**
+ * Resize canvas to fill screen 
+ */
+function fillScreen() {
+  if (!canvas) canvas = document.querySelector('canvas')
+  document.body.style.margin = '0'
+  canvas.style.width = '100%'
+  canvas.style.height = '100%'
+  canvas.width = canvas.clientWidth
+  canvas.height = canvas.clientHeight
+  canvas.style.width = ''
+  canvas.style.height = ''
+  gl.viewport(0,0, canvas.width, canvas.height)
+}
+
+/**
+ * Runs the animation using requestAnimationFrame. This is like a loop that
+ * runs once per screen refresh, but a loop won't work because we need to let 
+ * the browser do other things between ticks. Instead, we have a function that 
+ * requests itself be queued to be run again as its last step.
+ *
+ * @param {Number} milliseconds - milliseconds since web page loaded;
+ *        automatically provided by the browser when invoked with 
+ *        requestAnimationFrame
+ */
+function tick(milliseconds) {
+  const seconds = milliseconds / 1000
+  draw(seconds)
+  requestAnimationFrame(tick) // <- only call this here, nowhere else
+}
+
+let canvas, fpsDisplay;
+let pUniformLoc, viewportSizeUniformLoc;
+
+/**
+ * Draw frame 
+ */
+function draw(seconds) {
+  if (lastTime === null) lastTime = seconds;
+  const dt = seconds - lastTime;
+  lastTime = seconds;
+
+  if (dt > 0) {
+    const fps = 1 / dt;
+    fpsDisplay.innerHTML = fps.toFixed(1);
+  }
+
+  physics(dt);
+  let projMatrix;
+  if (canvas.width >= canvas.height)
+    projMatrix = new Float32Array([
+      canvas.height / canvas.width, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1 
+    ]);
+  else 
+    projMatrix = new Float32Array([
+      1, 0, 0, 0,
+      0, canvas.width / canvas.height, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1
+    ]);
+
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+
+  gl.useProgram(program)
+
+  const centers = new Float32Array(NUM_SPHERES * 3);
+  const radii = new Float32Array(NUM_SPHERES);
+  const colors = new Float32Array(NUM_SPHERES * 3);
+
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    centers[i * 3 + 0] = spheres[i].pos[0];
+    centers[i * 3 + 1] = spheres[i].pos[1];
+    centers[i * 3 + 2] = 0.0;
+    radii[i] = spheres[i].radius;
+    colors[i * 3 + 0] = spheres[i].color[0];
+    colors[i * 3 + 1] = spheres[i].color[1];
+    colors[i * 3 + 2] = spheres[i].color[2];
+  }
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, centerBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, centers, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, radiusBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, radii, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 0, 0);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, colors, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
+
+  gl.uniformMatrix4fv(pUniformLoc, false, projMatrix);
+  gl.uniform1f(viewportSizeUniformLoc, canvas.height);
+
+  gl.drawArrays(gl.POINTS, 0, NUM_SPHERES);
+
+  gl.disableVertexAttribArray(0);
+  gl.disableVertexAttribArray(1);
+  gl.disableVertexAttribArray(2);
+}
+
+window.addEventListener('load', setup)
+
+  </script>
+    <style>
+    body {
+        margin: 0; border: none; padding: 0;
+        display: flex; flex-direction: column;
+        width: 100%; height: 100vh;
+    }
+    .controls {
+        flex: 0 0 auto;
+    }
+    .controls > * { margin: 1em; }
+    .display {
+        flex-grow: 1;
+        line-height: 0rem;
+    }
+    </style>
+</head>
+<body>
+<canvas></canvas>
+<div id="fps" style="position:fixed; bottom:1ex; right:1ex; display:table;"></div>
+<form class="controls" action="javascript:void(0);" style="position:fixed; top:1ex; left:1ex; display:table;">
+    <label>Spheres: <input id="spheres" type="number" value="200" style="width:5em;"/></label>
+    <input id="submit" type="submit" value="Restart simulation"/>
+</form>
+</body>
+</html>

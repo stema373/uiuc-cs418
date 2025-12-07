@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <meta charset="utf-8">
+  <link rel="icon" href="data:,">
+  <title>Orbits</title>
+  <script src="wrapWebGL2.js"></script>
+  <script src="math.js"></script>
+  <script>
+
+/**
+ * Fetches, reads, and compiles GLSL; sets two global variables; and begins
+ * the animation
+ */
+async function setup() {
+  window.gl = document.querySelector('canvas').getContext('webgl2') 
+  gl.enable(gl.DEPTH_TEST)
+  const vs = await fetch('vs.glsl').then(res => res.text())
+  const fs = await fetch('fs.glsl').then(res => res.text())
+  window.program = compile(vs,fs)
+
+  setupGeometry()
+  fillScreen()
+  window.addEventListener('resize', fillScreen)
+
+  tick(0)
+}
+
+/**
+ * Compiles two shaders, links them together, looks up their uniform locations,
+ * and returns the result. Reports any shader errors to the console.
+ *
+ * @param {string} vs_source - the source code of the vertex shader
+ * @param {string} fs_source - the source code of the fragment shader 
+ * @return{WebGLProgram} the compiled and linked program 
+ */
+function compile(vs_source, fs_source) {
+  const vs = gl.createShader(gl.VERTEX_SHADER)
+  gl.shaderSource(vs, vs_source)
+  gl.compileShader(vs)
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(vs))
+    throw Error("Vertex shader compilation failed")
+  }
+
+  const fs = gl.createShader(gl.FRAGMENT_SHADER)
+  gl.shaderSource(fs, fs_source)
+  gl.compileShader(fs)
+  if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(fs))
+    throw Error("Fragment shader compilation failed")
+  }
+
+  const program = gl.createProgram()
+  gl.attachShader(program, vs)
+  gl.attachShader(program, fs)
+  gl.linkProgram(program)
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(program))
+    throw Error("Linking failed")
+  }
+
+  const uniforms = {}
+  for(let i=0; i<gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS); i+=1) {
+      let info = gl.getActiveUniform(program, i)
+      uniforms[info.name] = gl.getUniformLocation(program, info.name)
+  }
+  program.uniforms = uniforms
+
+  return program 
+}
+
+/**
+ * Runs the animation using requestAnimationFrame. This is like a loop that
+ * runs once per screen refresh, but a loop won't work because we need to let 
+ * the browser do other things between ticks. Instead, we have a function that 
+ * requests itself be queued to be run again as its last step.
+ *
+ * @param {Number} milliseconds - milliseconds since web page loaded;
+ *        automatically provided by the browser when invoked with 
+ *        requestAnimationFrame 
+ */
+function tick(milliseconds) {
+  const seconds = milliseconds / 1000
+  draw(seconds)
+  requestAnimationFrame(tick) // <- only call this here, nowhere else
+}
+
+/**
+ * Sets up geometry buffers for tetrahedron and octahedron
+ */
+function setupGeometry() {
+  const tetPositions = [
+    1,1,1,  -1,-1,1,  -1,1,-1,  1,-1,-1
+  ]
+  const tetColors = [
+    1,1,1,  0,0,1,  0,1,0,  1,0,0
+  ]
+  const tetIndices = [
+    0,1,2,  0,2,3,  0,3,1,  1,2,3
+  ]
+  
+  const octPositions = [
+    1,0,0,  0,1,0,  0,0,1,  0,-1,0,  0,0,-1,  -1,0,0
+  ]
+  const octColors = [
+    1,0.5,0.5,  0.5,1,0.5,  0.5,0.5,1,  0.5,0,0.5,  0.5,0.5,0,  0,0.5,0.5
+  ]
+  const octIndices = [
+    0,1,2,  0,2,3,  0,3,4,  0,4,1,  5,1,4,  5,4,3,  5,3,2,  5,2,1
+  ]
+  
+  window.tetrahedron = {
+    positionBuffer: gl.createBuffer(),
+    colorBuffer: gl.createBuffer(),
+    indexBuffer: gl.createBuffer(),
+    numIndices: tetIndices.length
+  }
+  
+  gl.bindBuffer(gl.ARRAY_BUFFER, tetrahedron.positionBuffer)
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(tetPositions), gl.STATIC_DRAW)
+  
+  gl.bindBuffer(gl.ARRAY_BUFFER, tetrahedron.colorBuffer)
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(tetColors), gl.STATIC_DRAW)
+  
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, tetrahedron.indexBuffer)
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(tetIndices), gl.STATIC_DRAW)
+  
+  window.octahedron = {
+    positionBuffer: gl.createBuffer(),
+    colorBuffer: gl.createBuffer(),
+    indexBuffer: gl.createBuffer(),
+    numIndices: octIndices.length
+  }
+  
+  gl.bindBuffer(gl.ARRAY_BUFFER, octahedron.positionBuffer)
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(octPositions), gl.STATIC_DRAW)
+  
+  gl.bindBuffer(gl.ARRAY_BUFFER, octahedron.colorBuffer)
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(octColors), gl.STATIC_DRAW)
+  
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, octahedron.indexBuffer)
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(octIndices), gl.STATIC_DRAW)
+}
+
+/**
+ * Draws a model with the given model matrix
+ */
+function drawModel(model, modelMatrix) {
+  const mvp = m4mul(window.vp, modelMatrix)
+  gl.uniformMatrix4fv(program.uniforms.mvp, false, mvp)
+  
+  gl.bindBuffer(gl.ARRAY_BUFFER, model.positionBuffer)
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0)
+  gl.enableVertexAttribArray(0)
+  
+  gl.bindBuffer(gl.ARRAY_BUFFER, model.colorBuffer)
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0)
+  gl.enableVertexAttribArray(1)
+  
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, model.indexBuffer)
+  gl.drawElements(gl.TRIANGLES, model.numIndices, gl.UNSIGNED_SHORT, 0)
+}
+
+/**
+ * Clears the screen and draws all celestial bodies
+ *
+ * @param {Number} seconds - the number of seconds since the animation began
+ */
+function draw(seconds) {
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+  gl.useProgram(program)
+
+  const view = m4view([0, 5, 10], [0, 0, 0], [0, 1, 0])
+  window.vp = m4mul(window.p, view)
+
+  // Sun
+  const sunRotation = (seconds / 2) * 2 * Math.PI
+  const sunModel = m4mul(m4rotY(sunRotation), m4scale(2, 2, 2))
+  drawModel(octahedron, sunModel)
+
+  // Earth
+  const earthOrbitPeriod = 5
+  const earthSpinPeriod = 0.5
+  const earthOrbitAngle = (seconds / earthOrbitPeriod) * 2 * Math.PI
+  const earthSpinAngle = (seconds / earthSpinPeriod) * 2 * Math.PI
+  const earthOrbitRadius = 5
+  
+  const earthOrbit = m4rotY(earthOrbitAngle)
+  const earthTranslate = m4trans(earthOrbitRadius, 0, 0)
+  const earthSpin = m4rotY(earthSpinAngle)
+  const earthScale = m4scale(0.8, 0.8, 0.8)
+  const earthModel = m4mul(earthOrbit, m4mul(earthTranslate, m4mul(earthSpin, earthScale)))
+  drawModel(octahedron, earthModel)
+
+  // Mars
+  const marsOrbitPeriod = earthOrbitPeriod * 1.9
+  const marsSpinPeriod = earthSpinPeriod * 2.2
+  const marsOrbitAngle = (seconds / marsOrbitPeriod) * 2 * Math.PI
+  const marsSpinAngle = (seconds / marsSpinPeriod) * 2 * Math.PI
+  const marsOrbitRadius = earthOrbitRadius * 1.6
+  
+  const marsOrbit = m4rotY(marsOrbitAngle)
+  const marsTranslate = m4trans(marsOrbitRadius, 0, 0)
+  const marsSpin = m4rotY(marsSpinAngle)
+  const marsScale = m4scale(0.7, 0.7, 0.7)
+  const marsModel = m4mul(marsOrbit, m4mul(marsTranslate, m4mul(marsSpin, marsScale)))
+  drawModel(octahedron, marsModel)
+
+  // Moon
+  const moonOrbitPeriod = 2.7
+  const moonOrbitAngle = (seconds / moonOrbitPeriod) * 2 * Math.PI
+  const moonOrbitRadius = 1.5
+  
+  const moonOrbit = m4rotY(moonOrbitAngle)
+  const moonTranslate = m4trans(moonOrbitRadius, 0, 0)
+  const moonTidalLock = m4rotY(moonOrbitAngle)
+  const moonScale = m4scale(0.3, 0.3, 0.3)
+  const moonModel = m4mul(earthOrbit, m4mul(earthTranslate, m4mul(moonOrbit, m4mul(moonTidalLock, m4mul(moonTranslate, moonScale)))))
+  drawModel(tetrahedron, moonModel)
+
+  // Phobos
+  const phobosOrbitPeriod = marsSpinPeriod * 0.5
+  const phobosOrbitAngle = (seconds / phobosOrbitPeriod) * 2 * Math.PI
+  const phobosOrbitRadius = 1.2
+  
+  const phobosOrbit = m4rotY(phobosOrbitAngle)
+  const phobosTranslate = m4trans(phobosOrbitRadius, 0, 0)
+  const phobosTidalLock = m4rotY(phobosOrbitAngle)
+  const phobosScale = m4scale(0.2, 0.2, 0.2)
+  const phobosModel = m4mul(marsOrbit, m4mul(marsTranslate, m4mul(phobosOrbit, m4mul(phobosTidalLock, m4mul(phobosTranslate, phobosScale)))))
+  drawModel(tetrahedron, phobosModel)
+
+  // Deimos
+  const deimosOrbitPeriod = marsSpinPeriod * 0.9
+  const deimosOrbitAngle = (seconds / deimosOrbitPeriod) * 2 * Math.PI
+  const deimosOrbitRadius = phobosOrbitRadius * 2
+  
+  const deimosOrbit = m4rotY(deimosOrbitAngle)
+  const deimosTranslate = m4trans(deimosOrbitRadius, 0, 0)
+  const deimosTidalLock = m4rotY(deimosOrbitAngle)
+  const deimosScale = m4scale(0.1, 0.1, 0.1)
+  const deimosModel = m4mul(marsOrbit, m4mul(marsTranslate, m4mul(deimosOrbit, m4mul(deimosTidalLock, m4mul(deimosTranslate, deimosScale)))))
+  drawModel(tetrahedron, deimosModel)
+}
+
+/**
+ * Resizes the canvas to completely fill the screen
+ */
+function fillScreen() {
+  let canvas = document.querySelector('canvas')
+  document.body.style.margin = '0'
+  canvas.style.width = '100vw'
+  canvas.style.height = '100vh'
+  canvas.width = canvas.clientWidth
+  canvas.height = canvas.clientHeight
+  canvas.style.width = ''
+  canvas.style.height = ''
+  if (window.gl) {
+    gl.viewport(0, 0, canvas.width, canvas.height)
+    window.p = m4perspNegZ(0.1, 100, 1.5, canvas.width, canvas.height)
+  }
+}
+
+window.addEventListener('load', setup)
+
+  </script>
+</head>
+<body>
+  <canvas width="300" height="300" style="background: white"></canvas>
+
+</body></html>

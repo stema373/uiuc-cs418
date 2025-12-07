@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <meta charset="utf-8">
+  <link rel="icon" href="data:,">
+  <title>Spheres</title>
+  <script src="wrapWebGL2.js"></script>
+  <script src="math.js"></script>
+  <script>
+let SPHERE_POS = [];
+let SPHERE_NORMALS = [];
+let SPHERE_TRIANGLES = [];
+
+let gl, program;
+let posNormalBuffer = null;
+let indexBuffer = null;
+let indexCount = 0;
+
+const NUM_SPHERES = 50;
+const CUBE_WIDTH = 2.0;
+const HALF = CUBE_WIDTH / 2;
+const SPHERE_DIAMETER = 0.15 * CUBE_WIDTH;
+const RADIUS = SPHERE_DIAMETER / 2;
+const MASS = 1.0;
+const GRAVITY = [0, -3.0, 0];
+const ELASTICITY = 0.9;
+
+let spheres = []
+let lastTime = null;
+let resetTimer = 0;
+
+const rand = (a=0, b=1) => a + Math.random() * (b - a);
+const randVec = (mag=1) => {
+  let u = Math.random() * 2 - 1, v = Math.random() * 2 - 1, w = Math.random() * 2 - 1;
+  let m = Math.sqrt(u * u + v * v + w * w) || 1;
+  return [u / m * mag, v / m * mag, w / m * mag];
+}
+
+/**
+ * Create GL buffers
+ */
+function createBuffers() {
+  const positions = [];
+  const normals = []
+
+  for (let i = 0; i < SPHERE_POS.length; i++) {
+    positions.push(...SPHERE_POS[i]);
+    normals.push(...SPHERE_NORMALS[i])
+  }
+
+  const stride = 6;
+  const interleaved = new Float32Array(SPHERE_POS.length * stride);
+  for (let i = 0; i < positions.length / 3; i++) {
+    interleaved[i * stride + 0] = positions[i * 3 + 0]
+    interleaved[i * stride + 1] = positions[i * 3 + 1]
+    interleaved[i * stride + 2] = positions[i * 3 + 2]
+    interleaved[i * stride + 3] = normals[i * 3 + 0]
+    interleaved[i * stride + 4] = normals[i * 3 + 1]
+    interleaved[i * stride + 5] = normals[i * 3 + 2]
+  }
+
+  const indices = []
+  for (let tri of SPHERE_TRIANGLES) {
+    indices.push(tri[0], tri[1], tri[2]);
+  }
+  indexCount = indices.length;
+
+  posNormalBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posNormalBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, interleaved, gl.STATIC_DRAW);
+
+  indexBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+}
+
+/**
+ * Initialize spheres
+ */
+function resetSpheres() {
+  spheres = [];
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    const margin = RADIUS;
+    const x = rand(-HALF + margin, HALF - margin);
+    const y = rand(-HALF + margin, HALF - margin);
+    const z = rand(-HALF + margin, HALF - margin);
+    const v = randVec(1.2);
+    const color = [Math.random() * 0.9 + 0.1, Math.random() * 0.9 + 0.1, Math.random() * 0.9 + 0.1]
+    spheres.push({pos: [x, y, z], vel: v, color})
+  }
+}
+
+/**
+ * Euler method collision resolution
+ */
+function physics(dt) {
+  if (dt <= 0) return;
+  const maxDt = 0.033;
+  if (dt > maxDt) dt = maxDt;
+
+  for (let s of spheres) {
+    s.vel = add(s.vel, mul(GRAVITY, dt));
+    s.pos = add(s.pos, mul(s.vel, dt));
+  }
+
+  for (let s of spheres) {
+    for (let a = 0; a < 3; a++) {
+      if (s.pos[a] < -HALF + RADIUS) {
+        s.pos[a] = -HALF + RADIUS;
+        if (s.vel[a] < 0) s.vel[a] = -s.vel[a] * ELASTICITY
+      }
+      if (s.pos[a] > HALF - RADIUS) {
+        s.pos[a] = HALF - RADIUS
+        if (s.vel[a] > 0) s.vel[a] = -s.vel[a] * ELASTICITY
+      }
+    }
+  }
+
+  for (let i = 0; i < NUM_SPHERES; i++) {
+    for (let j = i + 1; j < NUM_SPHERES; j++) {
+      let A = spheres[i], B = spheres[j];
+      let delta = sub(B.pos, A.pos);
+      let dist = mag(delta);
+      const minDist = RADIUS * 2;
+      if (dist === 0) {
+        delta = [rand(0.001, 0.01), rand(0.001, 0.01), rand(0.001, 0.01)]
+        dist = mag(delta)
+      }
+      if (dist < minDist) {
+        let n = div(delta, dist);
+        let penetration = minDist - dist;
+        let correction = mul(n, penetration / 2)
+        A.pos = sub(A.pos, correction)
+        B.pos = add(B.pos, correction)
+
+        let rv = sub(B.vel, A.vel);
+        let velAlong = dot(rv, n);
+        if (velAlong < 0) {
+          let jImp = -(1 + ELASTICITY) * velAlong / 2;
+          let impulse = mul(n, jImp)
+          A.vel = sub(A.vel, mul(impulse, 1 / MASS));
+          B.vel = add(B.vel, mul(impulse, 1 / MASS));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Compiles two shaders, links them together, looks up their uniform locations,
+ * and returns the result. Reports any shader errors to the console.
+ *
+ * @param {string} vs_source - the source code of the vertex shader 
+ * @param {string} fs_source - the source code of the fragment shader 
+ * @return{WebGLProgram} the compiled and linked program
+*/
+function compile(vs_source, fs_source) {
+  const vs = gl.createShader(gl.VERTEX_SHADER)
+  gl.shaderSource(vs, vs_source)
+  gl.compileShader(vs)
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(vs))
+    throw Error("Vertex shader compilation failed")
+  }
+
+  const fs = gl.createShader(gl.FRAGMENT_SHADER)
+  gl.shaderSource(fs, fs_source)
+  gl.compileShader(fs)
+  if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(fs))
+    throw Error("Fragment shader compilation failed")
+  }
+
+  const program = gl.createProgram()
+  gl.attachShader(program, vs)
+  gl.attachShader(program, fs)
+  gl.linkProgram(program)
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(program))
+    throw Error("Linking failed")
+  }
+
+  const uniforms = {}
+  for (let i=0; i<gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS); i+=1) {
+    let info = gl.getActiveUniform(program, i)
+    uniforms[info.name] = gl.getUniformLocation(program, info.name)
+  }
+  program.uniforms = uniforms
+
+  return program
+}
+
+/**
+ * Setup WebGL
+ */
+async function setup() {
+  const canvas = document.querySelector('canvas')
+  gl = canvas.getContext('webgl2')
+  gl.enable(gl.DEPTH_TEST)
+
+  const sphereData = await fetch("./sphere.json").then(r => r.json())
+
+  SPHERE_POS = sphereData.attributes[0]
+  SPHERE_NORMALS = sphereData.attributes[1]
+  SPHERE_TRIANGLES = sphereData.triangles
+
+  createBuffers()
+
+  const vs = await fetch('vs.glsl').then(res => res.text())
+  const fs = await fetch('fs.glsl').then(res => res.text())
+  program = compile(vs, fs)
+
+  fillScreen()
+  window.addEventListener('resize', fillScreen)
+
+  resetSpheres()
+  tick(0)
+}
+
+/**
+ * Resize canvas to fill screen 
+ */
+function fillScreen() {
+  let canvas = document.querySelector('canvas')
+  document.body.style.margin = '0'
+  canvas.style.width = '100%'
+  canvas.style.height = '100%'
+  canvas.width = canvas.clientWidth
+  canvas.height = canvas.clientHeight
+  canvas.style.width = ''
+  canvas.style.height = ''
+  gl.viewport(0,0, canvas.width, canvas.height)
+}
+
+/**
+ * Runs the animation using requestAnimationFrame. This is like a loop that
+ * runs once per screen refresh, but a loop won't work because we need to let 
+ * the browser do other things between ticks. Instead, we have a function that 
+ * requests itself be queued to be run again as its last step.
+ *
+ * @param {Number} milliseconds - milliseconds since web page loaded;
+ *        automatically provided by the browser when invoked with 
+ *        requestAnimationFrame
+ */
+function tick(milliseconds) {
+  const seconds = milliseconds / 1000
+  draw(seconds)
+  requestAnimationFrame(tick) // <- only call this here, nowhere else
+}
+
+/**
+ * Draw frame 
+ */
+function draw(seconds) {
+  if (lastTime === null) lastTime = seconds;
+  const dt = seconds - lastTime;
+  lastTime = seconds;
+
+  resetTimer += dt
+  if (resetTimer >= 15) {
+    resetSpheres()
+    resetTimer = 0
+  }
+
+  physics(dt);
+
+  const canvas = document.querySelector('canvas');
+  const projMatrix = m4perspNegZ(0.1, 100, Math.PI / 3, canvas.width, canvas.height)
+
+  const eye = [0, 0.5, 4.0];
+  const center = [0, 0, 0]
+  const up = [0, 1, 0]
+
+  const viewMatrix = m4view(eye, center, up)
+
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+
+  gl.useProgram(program)
+
+  const lightDir = [1, 2, 1]
+  const lightDirNorm = normalize(lightDir)
+
+  const mvLoc = gl.getUniformLocation(program, 'mv')
+  const colorLoc = gl.getUniformLocation(program, 'diffuseColor')
+  const pLoc = gl.getUniformLocation(program, 'p')
+  const lightDirLoc = gl.getUniformLocation(program, 'lightDirection')
+
+  gl.uniformMatrix4fv(mvLoc, false, viewMatrix)
+  gl.uniformMatrix4fv(pLoc, false, projMatrix)
+  gl.uniform3fv(lightDirLoc, lightDirNorm)
+
+  const eyePosLoc = gl.getUniformLocation(program, 'eyePosition')
+  gl.uniform3fv(eyePosLoc, eye)
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, posNormalBuffer)
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer)
+
+  const strideBytes = 6 * 4
+  gl.enableVertexAttribArray(0)
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, strideBytes, 0)
+  gl.enableVertexAttribArray(1)
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, strideBytes, 3 * 4)
+
+  for (let s of spheres) {
+    const model = m4mul(m4trans(s.pos[0], s.pos[1], s.pos[2]), m4scale(RADIUS, RADIUS, RADIUS))
+    const mv = m4mul(viewMatrix, model)
+    
+    gl.uniformMatrix4fv(mvLoc, false, mv)
+    gl.uniform3fv(colorLoc, s.color)
+    gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_SHORT, 0)
+  }
+
+  gl.disableVertexAttribArray(0)
+  gl.disableVertexAttribArray(1)
+}
+
+window.addEventListener('load', setup)
+
+  </script>
+    <style>
+    body {
+        margin: 0; border: none; padding: 0;
+        display: flex; flex-direction: column;
+        width: 100%; height: 100vh;
+    }
+    .controls {
+        flex: 0 0 auto;
+    }
+    .controls > * { margin: 1em; }
+    .display {
+        flex-grow: 1;
+        line-height: 0rem;
+    }
+    </style>
+</head>
+<body>
+<canvas></canvas>
+</body>
+</html>

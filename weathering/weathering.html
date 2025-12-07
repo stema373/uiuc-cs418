@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <meta charset="utf-8">
+  <link rel="icon" href="data:,">
+  <title>Weathering</title>
+  <script src="wrapWebGL2.js"></script>
+  <script src="math.js"></script>
+  <script>
+let terrainData = null 
+
+/**
+ * Helper Matrix function 
+ */ 
+function vec3Normalize(v) {
+  const len = Math.hypot(v[0], v[1], v[2])
+  return [v[0] / len, v[1] / len, v[2] / len]
+}
+
+/**
+ * Apply weathering smoothing to terrain heights 
+ * Only smooths in the vertical direction 
+ */ 
+function applyWeathering(heights, gridsize, iterations) {
+  for (let it = 0; it < iterations; it++) {
+    const newHeights = [...heights]
+
+    for (let i = 0; i < gridsize; i++) {
+      for (let j = 0; j < gridsize; j++) {
+        const idx = i * gridsize + j 
+        let sum = heights[idx]
+        let count = 1 
+
+        if (i > 0) {
+          sum += heights[(i - 1) * gridsize + j]
+          count++
+        }
+
+        if (i < gridsize - 1) {
+          sum += heights[(i + 1) * gridsize + j]
+          count++
+        }
+
+        if (j < gridsize - 1) {
+          sum += heights[i * gridsize + (j + 1)]
+          count++
+        }
+
+        if (j > 0) {
+          sum += heights[i * gridsize + (j - 1)]
+          count++
+        }
+
+        newHeights[idx] = sum / count
+      }
+    }
+
+    for (let i = 0; i < heights.length; i++) {
+      heights[i] = newHeights[i]
+    }
+  }
+
+  return heights
+}
+
+/**
+ * Generate terrain grid with fault algorithm
+ */
+function generateTerrain(gridsize, faults, weathering) {
+  const vertices = []
+  const heights = []
+
+  for (let i = 0; i < gridsize; i++) {
+    for (let j = 0; j < gridsize; j++) {
+      heights.push(0)
+    }
+  }
+
+  for (let f = 0; f < faults; f++) {
+    const px = Math.random() * (gridsize - 1)
+    const py = Math.random() * (gridsize - 1)
+
+    const angle = Math.random() * Math.PI * 2 
+    const dx = Math.cos(angle)
+    const dy = Math.sin(angle)
+
+    for (let i = 0; i < gridsize; i++) {
+      for (let j = 0; j < gridsize; j++) {
+        const idx = i * gridsize + j 
+        
+        const side = (j - px) * dx + (i - py) * dy 
+        if (side > 0) {
+          heights[idx] += 1 
+        } else {
+          heights[idx] -= 1
+        }
+      }
+    }
+  }
+
+  if (weathering > 0) applyWeathering(heights, gridsize, weathering)
+
+  if (faults > 0) {
+    let minH = heights[0]
+    let maxH = heights[0]
+    for (let h of heights) {
+      if (h < minH) minH = h 
+      if (h > maxH) maxH = h 
+    }
+
+    const c = 1.0 
+    const mid = (maxH + minH) / 2 
+    const range = maxH - minH 
+
+    if (range > 0) {
+      for (let i = 0; i < heights.length; i++) {
+        heights[i] = c * (heights[i] - mid) / range
+      }
+    }
+  }
+
+  for (let i = 0; i < gridsize; i++) {
+    for (let j = 0; j < gridsize; j++) {
+      const idx = i * gridsize + j 
+      const x = (j / (gridsize - 1)) * 2 - 1 
+      const z = (i / (gridsize - 1)) * 2 - 1 
+      const y = heights[idx]
+      vertices.push(x, y, z)
+    }
+  }
+
+  const normals = []
+  for (let i = 0; i < gridsize; i++) {
+    for (let j = 0; j < gridsize; j++) {
+      const idx = i * gridsize + j 
+
+      let n, s, e, w 
+
+      if (i > 0) {
+        const nIdx = (i - 1) * gridsize + j 
+        n = [vertices[nIdx * 3], vertices[nIdx * 3 + 1], vertices[nIdx * 3 + 2]]
+      } else {
+        n = [vertices[idx * 3], vertices[idx * 3 + 1], vertices[idx * 3 + 2]]
+      }
+
+      if (i < gridsize - 1) {
+        const sIdx = (i + 1) * gridsize + j 
+        s = [vertices[sIdx * 3], vertices[sIdx * 3 + 1], vertices[sIdx * 3 + 2]]
+      } else {
+        s = [vertices[idx * 3], vertices[idx * 3 + 1], vertices[idx * 3 + 2]]
+      }
+
+      if (j < gridsize - 1) {
+        const eIdx = i * gridsize + (j + 1) 
+        e = [vertices[eIdx * 3], vertices[eIdx * 3 + 1], vertices[eIdx * 3 + 2]]
+      } else {
+        e = [vertices[idx * 3], vertices[idx * 3 + 1], vertices[idx * 3 + 2]]
+      }
+
+      if (j > 0) {
+        const wIdx = i * gridsize + (j - 1) 
+        w = [vertices[wIdx * 3], vertices[wIdx * 3 + 1], vertices[wIdx * 3 + 2]]
+      } else {
+        w = [vertices[idx * 3], vertices[idx * 3 + 1], vertices[idx * 3 + 2]]
+      }
+
+      const ns = [n[0] - s[0], n[1] - s[1], n[2] - s[2]]
+      const we = [w[0] - e[0], w[1] - e[1], w[2] - e[2]]
+
+      const nx = ns[1] * we[2] - ns[2] * we[1]
+      const ny = ns[2] * we[0] - ns[0] * we[2]
+      const nz = ns[0] * we[1] - ns[1] * we[0]
+
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz)
+      if (len > 0) {
+        normals.push(nx / len, ny / len, nz / len)
+      } else {
+        normals.push(0, 1, 0)
+      }
+    }
+  }
+
+  const indices = []
+  for (let i = 0; i < gridsize - 1; i++) {
+    for (let j = 0; j < gridsize - 1; j++) {
+      const topLeft = i * gridsize + j 
+      const topRight = i * gridsize + j + 1 
+      const bottomLeft = (i + 1) * gridsize + j 
+      const bottomRight = (i + 1) * gridsize + j + 1 
+
+      indices.push(topLeft, bottomLeft, topRight)
+      indices.push(topRight, bottomLeft, bottomRight)
+    }
+  }
+
+  return {
+    vertices: new Float32Array(vertices),
+    normals: new Float32Array(normals),
+    indices: new Uint16Array(indices),
+    numTriangles: indices.length / 3
+  }
+}
+
+/**
+ * Setup WebGL buffers for terrain
+ */
+function setupTerrainBuffers(terrain) {
+  const positionBuffer = gl.createBuffer()
+  gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer)
+  gl.bufferData(gl.ARRAY_BUFFER, terrain.vertices, gl.STATIC_DRAW)
+
+  const normalBuffer = gl.createBuffer()
+  gl.bindBuffer(gl.ARRAY_BUFFER, normalBuffer)
+  gl.bufferData(gl.ARRAY_BUFFER, terrain.normals, gl.STATIC_DRAW)
+
+  const indexBuffer = gl.createBuffer()
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer)
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, terrain.indices, gl.STATIC_DRAW)
+
+  return {
+    position: positionBuffer,
+    normal: normalBuffer,
+    index: indexBuffer,
+    numTriangles: terrain.numTriangles
+  }
+}
+
+/**
+ * Compiles two shaders, links them together, looks up their uniform locations,
+ * and returns the result. Reports any shader errors to the console.
+ *
+ * @param {string} vs_source - the source code of the vertex shader 
+ * @param {string} fs_source - the source code of the fragment shader 
+ * @return{WebGLProgram} the compiled and linked program
+*/
+function compile(vs_source, fs_source) {
+  const vs = gl.createShader(gl.VERTEX_SHADER)
+  gl.shaderSource(vs, vs_source)
+  gl.compileShader(vs)
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(vs))
+    throw Error("Vertex shader compilation failed")
+  }
+
+  const fs = gl.createShader(gl.FRAGMENT_SHADER)
+  gl.shaderSource(fs, fs_source)
+  gl.compileShader(fs)
+  if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(fs))
+    throw Error("Fragment shader compilation failed")
+  }
+
+  const program = gl.createProgram()
+  gl.attachShader(program, vs)
+  gl.attachShader(program, fs)
+  gl.linkProgram(program)
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(program))
+    throw Error("Linking failed")
+  }
+
+  const uniforms = {}
+  for (let i=0; i<gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS); i+=1) {
+    let info = gl.getActiveUniform(program, i)
+    uniforms[info.name] = gl.getUniformLocation(program, info.name)
+  }
+  program.uniforms = uniforms
+
+  return program
+}
+
+/**
+ * Setup WebGL
+ */
+async function setup() {
+  const canvas = document.querySelector('canvas')
+  gl = canvas.getContext('webgl2')
+
+  gl.enable(gl.DEPTH_TEST)
+
+  const vs = await fetch('vs.glsl').then(res => res.text())
+  const fs = await fetch('fs.glsl').then(res => res.text())
+  window.program = compile(vs,fs)
+
+  fillScreen()
+  window.addEventListener('resize', fillScreen)
+
+  document.querySelector('#submit').addEventListener('click', event => {
+    const gridsize = Number(document.querySelector('#gridsize').value) || 2 
+    const faults = Number(document.querySelector('#faults').value) || 0 
+    const weathering = Number(document.querySelector('#weathering').value) || 0
+
+    const terrain = generateTerrain(gridsize, faults, weathering)
+    terrainData = setupTerrainBuffers(terrain)
+  })
+
+  tick(0)
+}
+
+/**
+ * Resize canvas to fill screen 
+ */
+function fillScreen() {
+  let canvas = document.querySelector('canvas')
+  document.body.style.margin = '0'
+  canvas.style.width = '100%'
+  canvas.style.height = '100%'
+  canvas.width = canvas.clientWidth
+  canvas.height = canvas.clientHeight
+  canvas.style.width = ''
+  canvas.style.height = ''
+  gl.viewport(0,0, canvas.width, canvas.height)
+}
+
+/**
+ * Runs the animation using requestAnimationFrame. This is like a loop that
+ * runs once per screen refresh, but a loop won't work because we need to let 
+ * the browser do other things between ticks. Instead, we have a function that 
+ * requests itself be queued to be run again as its last step.
+ *
+ * @param {Number} milliseconds - milliseconds since web page loaded;
+ *        automatically provided by the browser when invoked with 
+ *        requestAnimationFrame
+ */
+function tick(milliseconds) {
+  const seconds = milliseconds / 1000
+  draw(seconds)
+  requestAnimationFrame(tick) // <- only call this here, nowhere else
+}
+
+/**
+ * Draw frame 
+ */
+function draw(seconds) {
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+
+  if (!terrainData) return
+
+  gl.useProgram(program)
+
+  const radius = 2.5 
+  const cameraHeight = 0.5 
+  const cameraX = radius * Math.cos(seconds * 0.3)
+  const cameraZ = radius * Math.sin(seconds * 0.3)
+  const eye = [cameraX, cameraHeight, cameraZ]
+  const center = [0, 0, 0]
+  const up = [0, 1, 0]
+
+  const viewMatrix = m4view(eye, center, up)
+
+  const canvas = document.querySelector('canvas')
+  const projMatrix = m4perspNegZ(0.1, 100, Math.PI / 3, canvas.width, canvas.height)
+  
+  const lightDir = [1, 2, 1]
+  const lightDirNorm = vec3Normalize(lightDir)
+
+  const mvLoc = gl.getUniformLocation(program, 'mv')
+  const pLoc = gl.getUniformLocation(program, 'p')
+  const lightDirLoc = gl.getUniformLocation(program, 'lightDirection')
+  const eyePosLoc = gl.getUniformLocation(program, 'eyePosition')
+
+  gl.uniformMatrix4fv(mvLoc, false, viewMatrix)
+  gl.uniformMatrix4fv(pLoc, false, projMatrix)
+  gl.uniform3fv(lightDirLoc, lightDirNorm)
+  gl.uniform3fv(eyePosLoc, eye)
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, terrainData.position)
+  gl.enableVertexAttribArray(0)
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0)
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, terrainData.normal)
+  gl.enableVertexAttribArray(1)
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0)
+
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, terrainData.index)
+  gl.drawElements(gl.TRIANGLES, terrainData.numTriangles * 3, gl.UNSIGNED_SHORT, 0)
+}
+
+window.addEventListener('load', setup)
+
+  </script>
+    <style>
+    body {
+        margin: 0; border: none; padding: 0;
+        display: flex; flex-direction: column;
+        width: 100%; height: 100vh;
+    }
+    .controls {
+        flex: 0 0 auto;
+    }
+    .controls > * { margin: 1em; }
+    .display {
+        flex-grow: 1;
+        line-height: 0rem;
+    }
+    </style>
+</head>
+<body>
+<form class="controls" action="javascript:void(0);">
+    <label>Grid size: <input id="gridsize" type="number" value="50"/></label>
+    <label>Faults: <input id="faults" type="number" value="50"/></label>
+    <label>Weathering: <input id="weathering" type="number" value="0" /></label>
+    <input id="submit" type="submit" value="Regenerate Terrain"/>
+</form>
+<div class="display">
+    <canvas width="300" height="300"></canvas>
+</div>
+</body>
+</html>

@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <meta charset="utf-8">
+  <link rel="icon" href="data:,">
+  <title>OBJ file loading</title>
+  <script src="wrapWebGL2.js"></script>
+  <script src="math.js"></script>
+  <script>
+let objData = {
+  position: null,
+  normal: null,
+  index: null,
+  numTriangles: 0,
+}
+let materialState = {
+  type: 'color',
+  color: [0.8, 0.8, 0.8, 0.0],
+}
+let program = null
+let programTexture = null
+let currentProgram = null
+let currentTexture = null
+
+/**
+ * Parse OBJ file text into buffers
+ */ 
+async function loadOBJ(objPath) {
+  const text = await fetch(objPath).then(res => res.text())
+  const lines = text.split('\n')
+
+  const positions = []
+  const vertexColors = []
+  const texcoords = []
+  const normals = []
+  const faces = []
+
+  for (let line of lines) {
+    line = line.trim()
+    if (line.startsWith('v ')) {
+      const parts = line.split(/\s+/).slice(1).map(Number)
+      const [x, y, z, r, g, b] = parts
+      positions.push([x, y, z])
+      if (parts.length >= 6) vertexColors.push([r, g, b])
+      else vertexColors.push([0.8, 0.8, 0.8])
+    } else if (line.startsWith('vt ')) {
+      const [, u, v] = line.split(/\s+/)
+      texcoords.push([parseFloat(u), parseFloat(v)])
+    } else if (line.startsWith('vn ')) {
+      const [, x, y, z] = line.split(/\s+/)
+      normals.push([parseFloat(x), parseFloat(y), parseFloat(z)])
+    } else if (line.startsWith('f ')) {
+      const [, ...verts] = line.split(/\s+/)
+      faces.push(verts.map(v => v.split('/').map(x => parseInt(x) || 0)))
+    }
+  }
+
+  const vertexData = []
+  const colorData = []
+  const normalData = []
+  const texcoordData = []
+  const indices = []
+
+  const uniqueMap = new Map()
+  let nextIndex = 0 
+
+  for (const face of faces) {
+    for (let i = 0; i < face.length - 2; i++) {
+      const tri = [face[0], face[i + 1], face[i + 2]]
+      for (const [vStr, vtStr, vnStr] of tri) {
+        const v = parseInt(vStr) 
+        const vt = vtStr ? parseInt(vtStr) : 0 
+        const vn = vnStr ? parseInt(vnStr) : 0 
+
+        const key = `${v}/${vt}/${vn}`
+        if (!uniqueMap.has(key)) {
+          const pos = positions[(v > 0 ? v - 1 : positions.length + v)]
+          const tex = vt ? texcoords[(vt > 0 ? vt - 1 : texcoords.length + vt)] : [0, 0]
+          const nor = vn ? normals[(vn > 0 ? vn - 1 : normals.length + vn)] : [0, 0, 0]
+          const col = vertexColors[(v > 0 ? v - 1 : vertexColors.length + v)] || [0.8, 0.8, 0.8]
+
+          vertexData.push(...pos)
+          texcoordData.push(...tex)
+          normalData.push(...nor)
+          colorData.push(...col)
+
+          uniqueMap.set(key, nextIndex++)
+        }
+        indices.push(uniqueMap.get(key))
+      }
+    }
+  }
+
+  // Generate missing normals per-face
+  if (normalData.every(n => n === 0)) {
+    const perVertexNormals = Array(vertexData.length / 3).fill(0).map(() => [0, 0, 0])
+    for (let i = 0; i < indices.length; i += 3) {
+      const i0 = indices[i]
+      const i1 = indices[i + 1]
+      const i2 = indices[i + 2]
+      const v0 = vertexData.slice(i0 * 3, i0 * 3 + 3)
+      const v1 = vertexData.slice(i1 * 3, i1 * 3 + 3)
+      const v2 = vertexData.slice(i2 * 3, i2 * 3 + 3)
+      const n = normalize(cross(sub(v1, v0), sub(v2, v0)))
+      perVertexNormals[i0] = add(perVertexNormals[i0], n)
+      perVertexNormals[i1] = add(perVertexNormals[i1], n)
+      perVertexNormals[i2] = add(perVertexNormals[i2], n)
+    }
+    normalData.length = 0 
+    for (const n of perVertexNormals) normalData.push(...normalize(n))
+  }
+
+  // Orient OBJ 
+  for (let i = 0; i < vertexData.length; i += 3) {
+    const x = vertexData[i]
+    const y = vertexData[i + 1]
+    const z = vertexData[i + 2]
+    vertexData[i] = x 
+    vertexData[i + 1] = z 
+    vertexData[i + 2] = -y
+  }
+
+  for (let i = 0; i < normalData.length; i += 3) {
+    const nx = normalData[i]
+    const ny = normalData[i + 1]
+    const nz = normalData[i + 2]
+    normalData[i] = nx 
+    normalData[i + 1] = nz 
+    normalData[i + 2] = -ny
+  }
+
+  // Center and scale
+  const xs = []
+  const ys = []
+  const zs = []
+  for (let i = 0; i < vertexData.length; i += 3) {
+    xs.push(vertexData[i])
+    ys.push(vertexData[i + 1])
+    zs.push(vertexData[i + 2])
+  }
+  const min = [Math.min(...xs), Math.min(...ys), Math.min(...zs)]
+  const max = [Math.max(...xs), Math.max(...ys), Math.max(...zs)]
+  const center = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2]
+  const maxExtent = Math.max(max[0] - min[0], max[1] - min[1], max[2] - min[2])
+  const scale = 1.5 / maxExtent
+  
+  for (let i = 0; i < vertexData.length; i+= 3) {
+    vertexData[i] = (vertexData[i] - center[0]) * scale
+    vertexData[i + 1] = (vertexData[i + 1] - center[1]) * scale 
+    vertexData[i + 2] = (vertexData[i + 2] - center[2]) * scale
+  }
+
+  objData.position = gl.createBuffer()
+  gl.bindBuffer(gl.ARRAY_BUFFER, objData.position)
+
+  const stride = 8 
+  const packed = new Float32Array(vertexData.length / 3 * stride)
+  for (let i = 0; i < vertexData.length / 3; i++) {
+    packed[i * stride + 0] = vertexData[i * 3 + 0]
+    packed[i * stride + 1] = vertexData[i * 3 + 1]
+    packed[i * stride + 2] = vertexData[i * 3 + 2]
+    packed[i * stride + 3] = texcoordData[i * 2 + 0] || 0
+    packed[i * stride + 4] = texcoordData[i * 2 + 1] || 0
+    packed[i * stride + 5] = colorData[i * 3 + 0] || 0.8 
+    packed[i * stride + 6] = colorData[i * 3 + 1] || 0.8 
+    packed[i * stride + 7] = colorData[i * 3 + 2] || 0.8 
+  }
+  gl.bufferData(gl.ARRAY_BUFFER, packed, gl.STATIC_DRAW)
+
+  objData.normal = gl.createBuffer()
+  gl.bindBuffer(gl.ARRAY_BUFFER, objData.normal)
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(normalData), gl.STATIC_DRAW)
+
+  objData.index = gl.createBuffer()
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, objData.index)
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW)
+
+  objData.numTriangles = indices.length / 3 
+}
+
+/**
+ * Compiles two shaders, links them together, looks up their uniform locations,
+ * and returns the result. Reports any shader errors to the console.
+ *
+ * @param {string} vs_source - the source code of the vertex shader 
+ * @param {string} fs_source - the source code of the fragment shader 
+ * @return{WebGLProgram} the compiled and linked program
+*/
+function compile(vs_source, fs_source) {
+  const vs = gl.createShader(gl.VERTEX_SHADER)
+  gl.shaderSource(vs, vs_source)
+  gl.compileShader(vs)
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(vs))
+    throw Error("Vertex shader compilation failed")
+  }
+
+  const fs = gl.createShader(gl.FRAGMENT_SHADER)
+  gl.shaderSource(fs, fs_source)
+  gl.compileShader(fs)
+  if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(fs))
+    throw Error("Fragment shader compilation failed")
+  }
+
+  const program = gl.createProgram()
+  gl.attachShader(program, vs)
+  gl.attachShader(program, fs)
+  gl.linkProgram(program)
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(program))
+    throw Error("Linking failed")
+  }
+
+  const uniforms = {}
+  for (let i=0; i<gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS); i+=1) {
+    let info = gl.getActiveUniform(program, i)
+    uniforms[info.name] = gl.getUniformLocation(program, info.name)
+  }
+  program.uniforms = uniforms
+
+  return program
+}
+
+/**
+ * Setup WebGL
+ */
+async function setup() {
+  const canvas = document.querySelector('canvas')
+  gl = canvas.getContext('webgl2')
+
+  gl.enable(gl.DEPTH_TEST)
+
+  const vs = await fetch('vs.glsl').then(res => res.text())
+  const fs = await fetch('fs.glsl').then(res => res.text())
+  const fs_tex = await fetch('fs_tex.glsl').then(res => res.text())
+  program = compile(vs, fs)
+  programTexture = compile(vs, fs_tex)
+
+  currentProgram = program 
+
+  fillScreen()
+  window.addEventListener('resize', fillScreen)
+
+  document.getElementById('submit').addEventListener('click', async () => {
+    const objPath = document.getElementById('obj').value.trim()
+    const imgPath = document.getElementById('img').value.trim()
+
+    if (!objPath) {
+      return
+    }
+
+    await loadOBJ(objPath)
+      
+    const loadTexture = async imgPath => {
+      return new Promise((resolve, reject) => {
+        const img = new Image()
+        img.crossOrigin = ''
+        img.onload = () => {
+          const tex = gl.createTexture()
+          gl.bindTexture(gl.TEXTURE_2D, tex)
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img)
+          gl.generateMipmap(gl.TEXTURE_2D)
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR)
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+          resolve(tex)
+        }
+        img.onerror = reject 
+        img.src = imgPath
+      })
+    }
+
+    if (imgPath) {
+      currentTexture = await loadTexture(imgPath)
+      currentProgram = programTexture 
+      materialState.type = 'texture'
+    } else {
+      currentTexture = null 
+      currentProgram = program 
+      materialState.type = 'color'
+    }
+  })
+
+  tick(0)
+}
+
+/**
+ * Resize canvas to fill screen 
+ */
+function fillScreen() {
+  let canvas = document.querySelector('canvas')
+  document.body.style.margin = '0'
+  canvas.style.width = '100%'
+  canvas.style.height = '100%'
+  canvas.width = canvas.clientWidth
+  canvas.height = canvas.clientHeight
+  canvas.style.width = ''
+  canvas.style.height = ''
+  gl.viewport(0,0, canvas.width, canvas.height)
+}
+
+/**
+ * Runs the animation using requestAnimationFrame. This is like a loop that
+ * runs once per screen refresh, but a loop won't work because we need to let 
+ * the browser do other things between ticks. Instead, we have a function that 
+ * requests itself be queued to be run again as its last step.
+ *
+ * @param {Number} milliseconds - milliseconds since web page loaded;
+ *        automatically provided by the browser when invoked with 
+ *        requestAnimationFrame
+ */
+function tick(milliseconds) {
+  const seconds = milliseconds / 1000
+  draw(seconds)
+  requestAnimationFrame(tick) // <- only call this here, nowhere else
+}
+
+/**
+ * Draw frame 
+ */
+function draw(seconds) {
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+
+  if (!objData || !objData.position || !objData.index) return
+
+  gl.useProgram(currentProgram)
+
+  const radius = 2.5 
+  const cameraHeight = 1.5 
+  const cameraX = radius * Math.cos(seconds * 0.3)
+  const cameraZ = radius * Math.sin(seconds * 0.3)
+  const eye = [cameraX, cameraHeight, cameraZ]
+  const center = [0, 0, 0]
+  const up = [0, 1, 0]
+
+  const viewMatrix = m4view(eye, center, up)
+
+  const canvas = document.querySelector('canvas')
+  const projMatrix = m4perspNegZ(0.1, 100, Math.PI / 3, canvas.width, canvas.height)
+  
+  const lightDir = [1, 2, 1]
+  const lightDirNorm = normalize(lightDir)
+
+  const mvLoc = gl.getUniformLocation(currentProgram, 'mv')
+  const pLoc = gl.getUniformLocation(currentProgram, 'p')
+  const lightDirLoc = gl.getUniformLocation(currentProgram, 'lightDirection')
+
+  gl.uniformMatrix4fv(mvLoc, false, viewMatrix)
+  gl.uniformMatrix4fv(pLoc, false, projMatrix)
+  gl.uniform3fv(lightDirLoc, lightDirNorm)
+
+  if (currentProgram === program) {
+    const eyePosLoc = gl.getUniformLocation(currentProgram, 'eyePosition')
+    const rgbaLoc = gl.getUniformLocation(currentProgram, 'RGBA')
+    const color = materialState.type === 'color' ? materialState.color : [1, 1, 1, 0]
+
+    gl.uniform3fv(eyePosLoc, eye)
+    gl.uniform4fv(rgbaLoc, color)
+  } else if (currentProgram === programTexture) {
+    if (currentTexture) {
+      gl.activeTexture(gl.TEXTURE0)
+      gl.bindTexture(gl.TEXTURE_2D, currentTexture)
+    }
+    const texLoc = gl.getUniformLocation(currentProgram, 'u_texture')
+    gl.uniform1i(texLoc, 0)
+  }
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, objData.position)
+  gl.enableVertexAttribArray(0)
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 8 * 4, 0)
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, objData.normal)
+  gl.enableVertexAttribArray(1)
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0)
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, objData.position)
+  gl.enableVertexAttribArray(2)
+  gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 8 * 4, 3 * 4)
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, objData.position)
+  gl.enableVertexAttribArray(3)
+  gl.vertexAttribPointer(3, 3, gl.FLOAT, false, 8 * 4, 5 * 4)
+
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, objData.index)
+  gl.drawElements(gl.TRIANGLES, objData.numTriangles * 3, gl.UNSIGNED_SHORT, 0)
+}
+
+window.addEventListener('load', setup)
+
+  </script>
+    <style>
+    body {
+        margin: 0; border: none; padding: 0;
+        display: flex; flex-direction: column;
+        width: 100%; height: 100vh;
+    }
+    .controls {
+        flex: 0 0 auto;
+    }
+    .controls > * { margin: 1em; }
+    .display {
+        flex-grow: 1;
+        line-height: 0rem;
+    }
+    </style>
+</head>
+<body>
+<form class="controls" action="javascript:void(0);">
+    <label>File path: <input id="obj" type="text" value=''/></label>
+    <label>Image path: <input id="img" type="text" value=''/></label>
+    <input id="submit" type="submit" value="Load OBJ"/>
+</form>
+<div class="display">
+    <canvas width="300" height="300"></canvas>
+</div>
+</body>
+</html>
